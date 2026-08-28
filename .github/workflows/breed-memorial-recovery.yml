@@ -1,0 +1,113 @@
+name: Temporary Breed Memorial recovery
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch public sources
+        shell: bash
+        run: |
+          set -u
+          mkdir -p recovery/thread recovery/downloads
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36'
+          SHARE_ID='6a91f16c-8da4-83eb-86f7-2baedba91f52'
+
+          fetch() {
+            local url="$1"
+            local out="$2"
+            printf 'Fetching %s\n' "$url"
+            if curl --fail --location --compressed --silent --show-error \
+              --retry 5 --retry-all-errors --connect-timeout 30 --max-time 900 \
+              --user-agent "$UA" "$url" --output "$out"; then
+              printf 'OK %s bytes=%s\n' "$out" "$(stat -c %s "$out")" | tee -a recovery/fetch-status.txt
+            else
+              printf 'FAILED %s\n' "$url" | tee -a recovery/fetch-status.txt
+              rm -f "$out"
+            fi
+          }
+
+          fetch "https://chat.openai.com/share/${SHARE_ID}" recovery/shared-conversation.html
+          fetch "https://chatgpt.com/backend-api/share/${SHARE_ID}" recovery/shared-conversation.json
+          fetch "https://r.jina.ai/https://chatgpt.com/share/${SHARE_ID}" recovery/shared-conversation-jina.md
+          fetch "https://www.agarchive.net/games/morokuma/breed%20memorial.exe" recovery/downloads/breed-memorial-original.exe
+          fetch "https://hirotaka2014.sakura.ne.jp/mh0406/game/breed_memorial.exe" recovery/downloads/breed-memorial-official.exe
+          fetch "https://hirotaka2014.sakura.ne.jp/mh0406/game/breed_memorial.zip" recovery/downloads/breed-memorial-official.zip
+
+      - name: Decode shared conversation and inventory references
+        shell: bash
+        run: |
+          set -u
+          if curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/chickensintrees/chatgpt-share-reader/main/chatgpt_share_reader.py \
+            --output recovery/chatgpt_share_reader.py; then
+            if test -s recovery/shared-conversation.html; then
+              python3 recovery/chatgpt_share_reader.py \
+                --html recovery/shared-conversation.html \
+                --out recovery/thread || true
+            else
+              python3 recovery/chatgpt_share_reader.py \
+                6a91f16c-8da4-83eb-86f7-2baedba91f52 \
+                --out recovery/thread || true
+            fi
+          fi
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import pathlib
+          import re
+
+          root = pathlib.Path('recovery')
+          patterns = {
+              'urls': re.compile(r'https?://[^\\s"\'<>\\)\\]]+'),
+              'sandbox': re.compile(r'sandbox:/mnt/data/[^\\s"\'<>\\)\\]]+'),
+              'file_ids': re.compile(r'file_[0-9a-fA-F]{12,}'),
+              'sediment_ids': re.compile(r'sediment://file_[0-9a-fA-F]{12,}'),
+              'breed_archives': re.compile(r'Breed_Memorial[^\\s"\'<>\\)\\]]+\\.(?:zip|7z|rar|exe|z\\d+)', re.I),
+          }
+          found = {key: set() for key in patterns}
+          manifest = []
+          for path in sorted(root.rglob('*')):
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              manifest.append({
+                  'path': str(path),
+                  'size': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+              })
+              if len(data) > 20_000_000 and path.suffix.lower() not in {'.html', '.json', '.md', '.txt'}:
+                  continue
+              text = data.decode('utf-8', errors='replace')
+              for key, pattern in patterns.items():
+                  found[key].update(pattern.findall(text))
+          (root / 'references.json').write_text(
+              json.dumps({key: sorted(values) for key, values in found.items()}, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (root / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          PY
+
+      - name: Upload recovery material
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: breed-memorial-recovery
+          path: recovery/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
