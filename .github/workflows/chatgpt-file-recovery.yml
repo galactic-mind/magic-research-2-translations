@@ -1,0 +1,162 @@
+name: Temporary ChatGPT file recovery
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  recover-files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recover referenced build files from public share
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p recovered/diagnostics recovered/files
+          cat > recovered/recover.py <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import time
+          from urllib.parse import quote
+          import requests
+
+          SHARE = "6a91f16c-8da4-83eb-86f7-2baedba91f52"
+          TARGETS = {
+              "file_00000000858481f4b6a90309f1f1ae16": "Breed_Memorial_Multilingual_Universal_v30_RC43_TM21_VERSION_MISMATCH_FIXED.zip",
+              "file_000000007f78820a94a11fa411e163af": "Breed_Memorial_Multilingual_Universal_v30_RC32.zip",
+          }
+          OUT = pathlib.Path("recovered")
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+              "Accept": "*/*",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Referer": f"https://chatgpt.com/share/{SHARE}",
+              "Origin": "https://chatgpt.com",
+          }
+
+          s = requests.Session()
+          s.headers.update(HEADERS)
+          share_url = f"https://chatgpt.com/share/{SHARE}"
+          r = s.get(share_url, timeout=90)
+          (OUT / "diagnostics" / "share-status.txt").write_text(
+              f"status={r.status_code}\nurl={r.url}\nbytes={len(r.content)}\nheaders={dict(r.headers)!r}\n",
+              encoding="utf-8",
+          )
+          (OUT / "diagnostics" / "share.html").write_bytes(r.content)
+          r.raise_for_status()
+          html = r.text
+
+          report = {"share": SHARE, "targets": {}, "embedded_matches": {}}
+          for fid, name in TARGETS.items():
+              # Inventory any full URLs already embedded in the share page.
+              embedded = sorted(set(re.findall(r'https?://[^\\s"<>]+', html)))
+              report["embedded_matches"][fid] = [u for u in embedded if fid in u]
+
+              candidates = []
+              for host in ("chatgpt.com", "chat.openai.com"):
+                  base = f"https://{host}"
+                  candidates.extend([
+                      f"{base}/backend-api/files/download/{fid}?conversation_id={SHARE}&inline=false",
+                      f"{base}/backend-api/files/download/{fid}?share_id={SHARE}&inline=false",
+                      f"{base}/backend-api/files/download/{fid}?inline=false",
+                      f"{base}/backend-api/files/{fid}/download?conversation_id={SHARE}&inline=false",
+                      f"{base}/backend-api/files/{fid}/download?share_id={SHARE}&inline=false",
+                      f"{base}/backend-api/files/{fid}/download?inline=false",
+                      f"{base}/backend-api/files/download?file_id={fid}&conversation_id={SHARE}&inline=false",
+                      f"{base}/backend-api/files/download?file_id={fid}&share_id={SHARE}&inline=false",
+                  ])
+              candidates.extend(report["embedded_matches"][fid])
+
+              attempts = []
+              saved = None
+              for idx, url in enumerate(dict.fromkeys(candidates)):
+                  entry = {"url": url}
+                  try:
+                      resp = s.get(url, timeout=180, allow_redirects=False)
+                      entry.update({
+                          "status": resp.status_code,
+                          "bytes": len(resp.content),
+                          "headers": dict(resp.headers),
+                          "content_type": resp.headers.get("content-type", ""),
+                      })
+                      body = resp.content
+                      final_resp = resp
+
+                      if 300 <= resp.status_code < 400 and resp.headers.get("location"):
+                          location = resp.headers["location"]
+                          entry["redirect"] = location
+                          final_resp = s.get(location, timeout=600, allow_redirects=True)
+                          body = final_resp.content
+                          entry["final_status"] = final_resp.status_code
+                          entry["final_url"] = final_resp.url
+                          entry["final_bytes"] = len(body)
+                          entry["final_content_type"] = final_resp.headers.get("content-type", "")
+
+                      # Some endpoints return a JSON envelope containing a signed URL.
+                      ctype = final_resp.headers.get("content-type", "")
+                      if "json" in ctype.lower() or (body[:1] in {b"{", b"["} and len(body) < 5_000_000):
+                          try:
+                              payload = final_resp.json()
+                              entry["json"] = payload
+                              signed = payload.get("download_url") if isinstance(payload, dict) else None
+                              if isinstance(signed, str) and signed.startswith("http"):
+                                  dl = s.get(signed, timeout=900, allow_redirects=True)
+                                  entry["signed_status"] = dl.status_code
+                                  entry["signed_url"] = dl.url
+                                  entry["signed_bytes"] = len(dl.content)
+                                  entry["signed_content_type"] = dl.headers.get("content-type", "")
+                                  if dl.status_code == 200:
+                                      body = dl.content
+                                      final_resp = dl
+                          except Exception as exc:
+                              entry["json_error"] = repr(exc)
+
+                      if final_resp.status_code == 200 and len(body) > 1_000_000 and body[:2] in {b"PK", b"MZ"}:
+                          target = OUT / "files" / name
+                          target.write_bytes(body)
+                          saved = {
+                              "path": str(target),
+                              "size": len(body),
+                              "sha256": hashlib.sha256(body).hexdigest(),
+                              "source": url,
+                          }
+                          entry["saved"] = saved
+                          attempts.append(entry)
+                          break
+
+                      if len(body) <= 200_000:
+                          entry["body_preview"] = body[:20_000].decode("utf-8", errors="replace")
+                  except Exception as exc:
+                      entry["error"] = repr(exc)
+                  attempts.append(entry)
+                  time.sleep(0.2)
+
+              report["targets"][fid] = {"name": name, "saved": saved, "attempts": attempts}
+
+          (OUT / "diagnostics" / "report.json").write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps({k: v["saved"] for k, v in report["targets"].items()}, indent=2))
+          PY
+          python3 -m pip install --quiet requests
+          python3 recovered/recover.py
+
+      - name: Upload recovered build material
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatgpt-build-file-recovery
+          path: recovered/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
